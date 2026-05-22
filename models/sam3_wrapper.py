@@ -52,11 +52,23 @@ class SAM3Wrapper(BaseTracker):
 
             # Load SAM-3 Hugging Face model and processor
             logger.info(f"Loading SAM-3 model from Hugging Face: {self.checkpoint_path}")
-            self.model = Sam3VideoModel.from_pretrained(
-                self.checkpoint_path,
-                device_map=self.device,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-            )
+            try:
+                self.model = Sam3VideoModel.from_pretrained(
+                    self.checkpoint_path,
+                    device_map=self.device,
+                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+                )
+            except Exception as e:
+                # If accelerate is missing, load without device_map and move to device manually
+                if "accelerate" in str(e) or "device_map" in str(e):
+                    logger.info("The 'accelerate' package is missing. Bypassing device_map and transferring model to GPU manually...")
+                    self.model = Sam3VideoModel.from_pretrained(
+                        self.checkpoint_path,
+                        torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+                    )
+                    self.model.to(self.device)
+                else:
+                    raise e
             self.processor = Sam3VideoProcessor.from_pretrained(self.checkpoint_path)
             
             # Tweak for small objects like apples
