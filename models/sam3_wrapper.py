@@ -72,8 +72,9 @@ class SAM3Wrapper(BaseTracker):
             self.processor = Sam3VideoProcessor.from_pretrained(self.checkpoint_path)
             
             # Tweak for small objects like apples
-            self.model.config.score_threshold_detection = 0.3  # lower for more detections
-            self.model.config.new_det_thresh = 0.6
+            # Boost threshold slightly to filter low-confidence detections, reducing candidates (N) and saving VRAM during NMS
+            self.model.config.score_threshold_detection = 0.45  
+            self.model.config.new_det_thresh = 0.55
             
             self.frame_idx = 0
             self.precomputed_results = []
@@ -136,6 +137,14 @@ class SAM3Wrapper(BaseTracker):
                     )
                     
                     logger.info("Propagating and tracking across video frames...")
+                    
+                    # Force empty CUDA cache before starting video propagation to reclaim unallocated VRAM
+                    if torch.cuda.is_available():
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        logger.info("Flushed GPU cache prior to video session propagation.")
+                    
                     iterator = self.model.propagate_in_video_iterator(
                         inference_session=inference_session,
                         max_frame_num_to_track=len(video_frames)-1,
@@ -152,6 +161,10 @@ class SAM3Wrapper(BaseTracker):
                         for model_outputs in iterator:
                             processed = self.processor.postprocess_outputs(inference_session, model_outputs)
                             outputs_per_frame[model_outputs.frame_idx] = processed
+                            
+                            # Periodically empty CUDA cache at every frame step to avoid VRAM fragmentation
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     
                     # Convert to standard format
                     self.precomputed_results = [[] for _ in range(len(video_frames))]
