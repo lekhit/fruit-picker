@@ -204,7 +204,9 @@ def main():
                 tracking_history=tracking_history,
                 output_path=video_out_path,
                 fps=15,
-                draw_masks=(model_name != "yolo") # Draw high-resolution masks for SAM-3/DEVA, bboxes for YOLO
+                draw_masks=(model_name != "yolo"), # Draw high-resolution masks for SAM-3/DEVA
+                draw_boxes=(model_name == "yolo"), # Draw bounding boxes only if we are using YOLO (since it has no masks)
+                draw_ids=False # Remove persistent track ID label overlay as requested by the user
             )
             logger.info(f"Tracking video saved to: {video_out_path}")
             

@@ -10,7 +10,7 @@ logger = logging.getLogger("AppleTrackerBenchmark.visualizer")
 np.random.seed(42)
 TRACK_COLORS = np.random.randint(0, 255, size=(1000, 3), dtype=np.uint8)
 
-def draw_overlays(frame, detections, draw_masks=True):
+def draw_overlays(frame, detections, draw_masks=True, draw_boxes=False, draw_ids=False):
     """
     Draws semi-transparent segmentation masks, bounding boxes, and persistent ID labels
     on a video frame. Ensures each track ID gets a consistent color.
@@ -28,6 +28,7 @@ def draw_overlays(frame, detections, draw_masks=True):
         color = TRACK_COLORS[tid % len(TRACK_COLORS)]
         color_bgr = (int(color[0]), int(color[1]), int(color[2]))
         
+        has_mask = False
         # 1. Draw transparent segmentation mask if available and requested
         if draw_masks and mask is not None:
             # Ensure mask matches frame dimensions
@@ -47,34 +48,54 @@ def draw_overlays(frame, detections, draw_masks=True):
             # Draw fine border around mask
             contours, _ = cv2.findContours((mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(annotated, contours, -1, color_bgr, 1)
+            has_mask = True
 
-        # 2. Draw bounding box
-        ymin, xmin, ymax, xmax = box
-        cv2.rectangle(annotated, (xmin, ymin), (xmax, ymax), color_bgr, 2)
+        # 2. Draw bounding box (draw if draw_boxes is True, or if we have no mask fallback)
+        if draw_boxes or (not has_mask and mask is None):
+            ymin, xmin, ymax, xmax = box
+            cv2.rectangle(annotated, (xmin, ymin), (xmax, ymax), color_bgr, 2)
+            
+            # 3. Draw premium ID label tag if requested
+            if draw_ids:
+                label = f"ID: {tid} ({int(score * 100)}%)"
+                font = cv2.FONT_HERSHEY_DUPLEX
+                font_scale = 0.5
+                thickness = 1
+                
+                # Compute text size for tag background box
+                (w, h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                
+                # Tag placement slightly above bounding box
+                tag_ymin = max(ymin - h - 6, 0)
+                tag_ymax = min(ymin, H)
+                tag_xmin = xmin
+                tag_xmax = min(xmin + w + 10, W)
+                
+                # Draw solid tag background box
+                cv2.rectangle(annotated, (tag_xmin, tag_ymin), (tag_xmax, tag_ymax), color_bgr, cv2.FILLED)
+                # Draw text inside tag
+                cv2.putText(annotated, label, (tag_xmin + 5, tag_ymin + h + 2), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
         
-        # 3. Draw premium ID label tag
-        label = f"ID: {tid} ({int(score * 100)}%)"
-        font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 0.5
-        thickness = 1
-        
-        # Compute text size for tag background box
-        (w, h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-        
-        # Tag placement slightly above bounding box
-        tag_ymin = max(ymin - h - 6, 0)
-        tag_ymax = min(ymin, H)
-        tag_xmin = xmin
-        tag_xmax = min(xmin + w + 10, W)
-        
-        # Draw solid tag background box
-        cv2.rectangle(annotated, (tag_xmin, tag_ymin), (tag_xmax, tag_ymax), color_bgr, cv2.FILLED)
-        # Draw text inside tag
-        cv2.putText(annotated, label, (tag_xmin + 5, tag_ymin + h + 2), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-        
+        elif draw_ids:
+            # Draw ID label tag anyway if requested (placed slightly above bounding box)
+            ymin, xmin, ymax, xmax = box
+            label = f"ID: {tid} ({int(score * 100)}%)"
+            font = cv2.FONT_HERSHEY_DUPLEX
+            font_scale = 0.5
+            thickness = 1
+            
+            (w, h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            tag_ymin = max(ymin - h - 6, 0)
+            tag_ymax = min(ymin, H)
+            tag_xmin = xmin
+            tag_xmax = min(xmin + w + 10, W)
+            
+            cv2.rectangle(annotated, (tag_xmin, tag_ymin), (tag_xmax, tag_ymax), color_bgr, cv2.FILLED)
+            cv2.putText(annotated, label, (tag_xmin + 5, tag_ymin + h + 2), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            
     return annotated
 
-def generate_video(frames_dir, tracking_history, output_path, fps=15, draw_masks=True):
+def generate_video(frames_dir, tracking_history, output_path, fps=15, draw_masks=True, draw_boxes=False, draw_ids=False):
     """
     Renders the tracking history onto the source frames and compiles them into an MP4 video.
     """
@@ -116,7 +137,7 @@ def generate_video(frames_dir, tracking_history, output_path, fps=15, draw_masks
                 logger.warning(f"Failed to read frame: {frame_file}. Skipping.")
                 continue
                 
-            annotated = draw_overlays(frame, detections, draw_masks=draw_masks)
+            annotated = draw_overlays(frame, detections, draw_masks=draw_masks, draw_boxes=draw_boxes, draw_ids=draw_ids)
             writer.write(annotated)
             
         logger.info("Video rendering successfully completed.")
