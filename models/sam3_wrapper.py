@@ -13,7 +13,7 @@ logger = logging.getLogger("AppleTrackerBenchmark.sam3")
 SAM3_AVAILABLE = False
 try:
     # This matches the official Meta facebookresearch/sam3 library structure
-    from sam3.build_sam import build_sam3_video_predictor
+    from sam3.model_builder import build_sam3_video_predictor
     SAM3_AVAILABLE = True
 except ImportError:
     logger.warning("Official 'sam3' library not found. Wrapper will fall back to CPU Centroid Tracker for dry-runs.")
