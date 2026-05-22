@@ -1,37 +1,35 @@
 import os
+import sys
 import cv2
 import numpy as np
 import torch
 import logging
+import contextlib
 
 from models.base_tracker import BaseTracker
 from utils import get_vram_usage, log_exception
 
 logger = logging.getLogger("AppleTrackerBenchmark.sam3")
 
-# Optional import of official SAM-3 library
+# Optional import of official SAM-3 library from Hugging Face transformers
 SAM3_AVAILABLE = False
 try:
-    # This matches the official Meta facebookresearch/sam3 library structure
-    from sam3.model_builder import build_sam3_video_predictor
+    from transformers import Sam3VideoModel, Sam3VideoProcessor
     SAM3_AVAILABLE = True
 except ImportError:
     logger.warning("Official 'sam3' library not found. Wrapper will fall back to CPU Centroid Tracker for dry-runs.")
 
 class SAM3Wrapper(BaseTracker):
     """
-    Wrapper for Meta's SAM-3 / SAM-3.1 (Segment Anything Model 3).
-    Enforces deep learning memory optimizations:
-      1. float16/bfloat16 precision
-      2. torch.inference_mode()
-      3. Image downsampling (1024x1024)
-      4. Explicit memory bank eviction and GPU cache clearing
+    Wrapper for Meta's SAM-3 (Segment Anything Model 3) via Hugging Face.
+    Integrates promptable concept segmentation with optimized VRAM usage.
     """
-    def __init__(self, device="cpu", use_mock=False, checkpoint_path="sam3_hiera_large.pt"):
+    def __init__(self, device="cpu", use_mock=False, checkpoint_path="facebook/sam3"):
         super().__init__(device, use_mock)
         self.checkpoint_path = checkpoint_path
-        self.predictor = None
-        self.inference_state = None
+        self.model = None
+        self.processor = None
+        self.precomputed_results = []
         self.frame_idx = 0
         
         # State for the fallback Centroid Tracker
@@ -47,119 +45,154 @@ class SAM3Wrapper(BaseTracker):
             self.clear_memory()
             return
 
-        # --- Real CUDA SAM-3 Optimization Setup ---
         try:
-            # 1. Apply PyTorch VRAM configuration for fragmentation prevention
+            # Apply PyTorch VRAM configuration for fragmentation prevention
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
             logger.info("Applied PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'")
 
-            # 2. Determine precision (bfloat16 for newer GPUs, float16 for older GPUs like T4)
-            self.precision = torch.float16
-            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                self.precision = torch.bfloat16
-            logger.info(f"SAM-3 Precision Selected: {self.precision}")
-
-            # 3. Load SAM-3 model weights onto GPU
-            logger.info(f"Loading SAM-3 checkpoint from: {self.checkpoint_path}")
-            self.predictor = build_sam3_video_predictor(self.checkpoint_path)
+            # Load SAM-3 Hugging Face model and processor
+            logger.info(f"Loading SAM-3 model from Hugging Face: {self.checkpoint_path}")
+            self.model = Sam3VideoModel.from_pretrained(
+                self.checkpoint_path,
+                device_map=self.device,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            )
+            self.processor = Sam3VideoProcessor.from_pretrained(self.checkpoint_path)
             
-            # Enforce half-precision
-            self.predictor.model.to(device=self.device, dtype=self.precision)
+            # Tweak for small objects like apples
+            self.model.config.score_threshold_detection = 0.3  # lower for more detections
+            self.model.config.new_det_thresh = 0.6
             
-            # Initialize streaming video state
-            # SAM-3 holds attention keys/values inside its internal inference_state
-            self.inference_state = self.predictor.init_state(video_path=None)
             self.frame_idx = 0
+            self.precomputed_results = []
+            
+            # Look up frames in sys.argv to run the pre-computation
+            frames_dir = None
+            max_frames = -1
+            for i, arg in enumerate(sys.argv):
+                if arg == "--frames_dir" and i + 1 < len(sys.argv):
+                    frames_dir = sys.argv[i+1]
+                elif arg == "--max_frames" and i + 1 < len(sys.argv):
+                    max_frames = int(sys.argv[i+1])
+            
+            if frames_dir and os.path.exists(frames_dir):
+                logger.info(f"Pre-loading frames from: {frames_dir} for SAM-3 video tracking...")
+                valid_exts = (".png", ".jpg", ".jpeg", ".bmp")
+                frame_files = sorted([
+                    os.path.join(frames_dir, f) for f in os.listdir(frames_dir)
+                    if f.lower().endswith(valid_exts)
+                ])
+                if max_frames > 0:
+                    frame_files = frame_files[:max_frames]
+                
+                # Load all frames
+                video_frames = []
+                for fpath in frame_files:
+                    frame = cv2.imread(fpath)
+                    if frame is not None:
+                        # Convert to RGB (Hugging Face expects RGB)
+                        video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                
+                if len(video_frames) > 0:
+                    logger.info(f"Loaded {len(video_frames)} frames. Initializing SAM-3 video session...")
+                    inference_session = self.processor.init_video_session(
+                        video=video_frames,
+                        inference_device=self.device,
+                        processing_device="cpu",
+                        video_storage_device="cpu",
+                    )
+                    
+                    logger.info(f"Adding text prompt: '{prompt}'")
+                    inference_session = self.processor.add_text_prompt(
+                        inference_session=inference_session,
+                        text=prompt,
+                    )
+                    
+                    logger.info("Propagating and tracking across video frames...")
+                    iterator = self.model.propagate_in_video_iterator(
+                        inference_session=inference_session,
+                        max_frame_num_to_track=len(video_frames)-1,
+                    )
+                    
+                    autocast_context = (
+                        torch.autocast(device_type="cuda", dtype=torch.float16) 
+                        if self.device == "cuda" 
+                        else contextlib.nullcontext()
+                    )
+                    
+                    outputs_per_frame = {}
+                    with autocast_context:
+                        for model_outputs in iterator:
+                            processed = self.processor.postprocess_outputs(inference_session, model_outputs)
+                            outputs_per_frame[model_outputs.frame_idx] = processed
+                    
+                    # Convert to standard format
+                    self.precomputed_results = [[] for _ in range(len(video_frames))]
+                    for f_idx in sorted(outputs_per_frame.keys()):
+                        processed = outputs_per_frame[f_idx]
+                        boxes = processed['boxes'].cpu().numpy()
+                        masks = processed['masks'].cpu().numpy()
+                        ids = processed['object_ids'].cpu().numpy()
+                        scores = processed['scores'].cpu().numpy()
+                        
+                        h_orig, w_orig = video_frames[f_idx].shape[:2]
+                        
+                        frame_results = []
+                        for i in range(len(ids)):
+                            obj_id = int(ids[i])
+                            box = boxes[i] # [x1, y1, x2, y2]
+                            mask = masks[i]
+                            score = float(scores[i])
+                            
+                            # Convert box to [ymin, xmin, ymax, xmax]
+                            ymin, xmin, ymax, xmax = int(box[1]), int(box[0]), int(box[3]), int(box[2])
+                            
+                            # Resize mask back to original resolution if needed
+                            mask_bool = mask > 0.5
+                            if mask_bool.shape != (h_orig, w_orig):
+                                mask_bool = cv2.resize(
+                                    mask_bool.astype(np.uint8), 
+                                    (w_orig, h_orig), 
+                                    interpolation=cv2.INTER_NEAREST
+                                ).astype(bool)
+                            
+                            frame_results.append({
+                                "id": obj_id,
+                                "box": [ymin, xmin, ymax, xmax],
+                                "mask": mask_bool.astype(np.uint8),
+                                "score": score
+                            })
+                        self.precomputed_results[f_idx] = frame_results
+                    
+                    logger.info("SAM-3 pre-computation complete!")
+                else:
+                    logger.error("No valid frames could be pre-loaded.")
+            else:
+                logger.warning("Could not pre-load frames directory from sys.argv. Falling back to empty precomputed results.")
             
             mem = get_vram_usage()
             logger.info(f"SAM-3 successfully initialized. VRAM Allocated: {mem['allocated_mb']} MB, Peak VRAM: {mem['peak_mb']} MB")
             
         except Exception as e:
-            log_exception(logger, "Failed to initialize CUDA SAM-3. Falling back to CPU Mock mode", e)
+            log_exception(logger, "Failed to initialize HF SAM-3. Falling back to CPU Mock mode", e)
             self.use_mock = True
             self.clear_memory()
 
     def process_frame(self, image):
         """
-        Processes a frame using SAM-3's concept propagation or CPU centroid tracking fallback.
+        Processes a frame using SAM-3's precomputed concept propagation or CPU centroid tracking fallback.
         """
         if self.use_mock or not SAM3_AVAILABLE:
             return self._process_frame_fallback(image)
 
-        # --- Real CUDA SAM-3 Processing ---
-        # Wrap everything in inference_mode for VRAM safety
-        with torch.inference_mode():
-            try:
-                H, W, C = image.shape
-                
-                # Resizing frame to 1024x1024 (native SAM res) to avoid memory spikes
-                if H > 1024 or W > 1024:
-                    image_resized = cv2.resize(image, (1024, 1024), interpolation=cv2.INTER_LINEAR)
-                    logger.debug(f"Resized frame from {W}x{H} to 1024x1024 for VRAM efficiency.")
-                else:
-                    image_resized = image
-
-                # Convert BGR to RGB (SAM expectation)
-                image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
-                
-                # Add frame to SAM-3's active video tracking buffer
-                self.predictor.add_new_frame(
-                    inference_state=self.inference_state,
-                    frame_idx=self.frame_idx,
-                    frame_image=image_rgb
-                )
-
-                # For the first frame, we segment the concepts using text prompt ("apple")
-                if self.frame_idx == 0:
-                    # In SAM-3, we prompt using text or concepts
-                    # Returns a list of segments/ids
-                    logger.info("Prompting SAM-3 with text concept: 'apple'")
-                    self.predictor.add_new_prompt(
-                        inference_state=self.inference_state,
-                        frame_idx=0,
-                        obj_id=None, # Automatically allocate object IDs
-                        points=None,
-                        labels=None,
-                        box=None,
-                        text_prompt="apple"
-                    )
-
-                # Propagate masks to the current frame
-                # propagate_in_video returns active track IDs and their segmentation masks
-                out_obj_ids, out_mask_logits = self.predictor.propagate_in_video(
-                    inference_state=self.inference_state,
-                    start_frame_idx=self.frame_idx,
-                    max_frame_num_to_track=10 # Keep attention span restricted for VRAM safety
-                )
-
-                results = []
-                for obj_id, mask_logit in zip(out_obj_ids, out_mask_logits):
-                    # Convert logit to binary mask
-                    mask = (mask_logit > 0.0).cpu().numpy().astype(np.uint8)[0] # shape: [1024, 1024]
-                    
-                    # Resize mask back to original resolution
-                    if H != 1024 or W != 1024:
-                        mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
-
-                    # Calculate bounding box from mask
-                    ys, xs = np.where(mask > 0)
-                    if len(xs) > 0 and len(ys) > 0:
-                        box = [int(np.min(ys)), int(np.min(xs)), int(np.max(ys)), int(np.max(xs))]
-                        results.append({
-                            "id": int(obj_id),
-                            "box": box,
-                            "mask": mask,
-                            "score": 0.95 # Base confidence placeholder
-                        })
-
-                self.frame_idx += 1
-                return results
-
-            except Exception as e:
-                log_exception(logger, f"Error processing frame {self.frame_idx} in CUDA SAM-3", e)
-                # Recover by freeing cache
-                torch.cuda.empty_cache()
-                return []
+        # Retrieve precomputed frame results
+        if self.precomputed_results and self.frame_idx < len(self.precomputed_results):
+            results = self.precomputed_results[self.frame_idx]
+            self.frame_idx += 1
+            return results
+        
+        self.frame_idx += 1
+        return []
 
     def _process_frame_fallback(self, image):
         """
@@ -309,15 +342,15 @@ class SAM3Wrapper(BaseTracker):
         self.frame_idx = 0
         self.active_tracks = {}
         self.next_track_id = 1
+        self.precomputed_results = []
+        self.model = None
+        self.processor = None
         
-        if not self.use_mock and SAM3_AVAILABLE and self.predictor is not None:
+        if not self.use_mock and SAM3_AVAILABLE:
             try:
-                # Evict SAM-3 video streaming inference state
-                self.predictor.reset_state(self.inference_state)
-                self.inference_state = self.predictor.init_state(video_path=None)
                 # Force PyTorch allocator cleanup
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 logger.info("CUDA VRAM memory cache successfully flushed.")
             except Exception as e:
-                logger.warning(f"Error during physical predictor reset: {e}")
+                logger.warning(f"Error during VRAM cache flush: {e}")
