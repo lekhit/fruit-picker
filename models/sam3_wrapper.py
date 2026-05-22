@@ -16,8 +16,8 @@ SAM3_AVAILABLE = False
 try:
     from transformers import Sam3VideoModel, Sam3VideoProcessor
     SAM3_AVAILABLE = True
-except ImportError:
-    logger.warning("Official 'sam3' library not found. Wrapper will fall back to CPU Centroid Tracker for dry-runs.")
+except ImportError as e:
+    logger.warning(f"Official 'sam3' library not found. Reason: {e}. Wrapper will fall back to CPU Centroid Tracker for dry-runs.")
 
 class SAM3Wrapper(BaseTracker):
     """
