@@ -99,11 +99,26 @@ class SAM3Wrapper(BaseTracker):
                 
                 # Load all frames
                 video_frames = []
+                orig_shapes = []
                 for fpath in frame_files:
                     frame = cv2.imread(fpath)
                     if frame is not None:
+                        h_orig, w_orig = frame.shape[:2]
+                        orig_shapes.append((h_orig, w_orig))
+                        
+                        # Downsample to a maximum dimension of 640 to prevent CUDA OOM
+                        # while keeping aspect ratio intact
+                        max_dim = 640
+                        if max(h_orig, w_orig) > max_dim:
+                            scale = max_dim / float(max(h_orig, w_orig))
+                            new_w = int(w_orig * scale)
+                            new_h = int(h_orig * scale)
+                            frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        else:
+                            frame_resized = frame
+                            
                         # Convert to RGB (Hugging Face expects RGB)
-                        video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        video_frames.append(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
                 
                 if len(video_frames) > 0:
                     logger.info(f"Loaded {len(video_frames)} frames. Initializing SAM-3 video session...")
@@ -147,7 +162,11 @@ class SAM3Wrapper(BaseTracker):
                         ids = processed['object_ids'].cpu().numpy()
                         scores = processed['scores'].cpu().numpy()
                         
-                        h_orig, w_orig = video_frames[f_idx].shape[:2]
+                        h_orig, w_orig = orig_shapes[f_idx]
+                        h_resized, w_resized = video_frames[f_idx].shape[:2]
+                        
+                        scale_x = w_orig / float(w_resized)
+                        scale_y = h_orig / float(h_resized)
                         
                         frame_results = []
                         for i in range(len(ids)):
@@ -156,17 +175,22 @@ class SAM3Wrapper(BaseTracker):
                             mask = masks[i]
                             score = float(scores[i])
                             
+                            # Rescale box back to original coordinates
+                            x1 = int(box[0] * scale_x)
+                            y1 = int(box[1] * scale_y)
+                            x2 = int(box[2] * scale_x)
+                            y2 = int(box[3] * scale_y)
+                            
                             # Convert box to [ymin, xmin, ymax, xmax]
-                            ymin, xmin, ymax, xmax = int(box[1]), int(box[0]), int(box[3]), int(box[2])
+                            ymin, xmin, ymax, xmax = y1, x1, y2, x2
                             
                             # Resize mask back to original resolution if needed
                             mask_bool = mask > 0.5
-                            if mask_bool.shape != (h_orig, w_orig):
-                                mask_bool = cv2.resize(
-                                    mask_bool.astype(np.uint8), 
-                                    (w_orig, h_orig), 
-                                    interpolation=cv2.INTER_NEAREST
-                                ).astype(bool)
+                            mask_bool = cv2.resize(
+                                mask_bool.astype(np.uint8), 
+                                (w_orig, h_orig), 
+                                interpolation=cv2.INTER_NEAREST
+                            ).astype(bool)
                             
                             frame_results.append({
                                 "id": obj_id,
